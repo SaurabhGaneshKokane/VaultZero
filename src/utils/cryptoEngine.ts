@@ -168,36 +168,54 @@ export function pemToArrayBuffer(pem: string): ArrayBuffer {
  * Imports a PEM-encoded RSA-OAEP public key (SPKI format).
  */
 export async function importRsaPublicKey(pem: string): Promise<CryptoKey> {
+  if (!pem || typeof pem !== "string" || !pem.trim()) {
+    throw new Error("Recipient Public Key is missing or empty.");
+  }
   const subtle = getSubtleCrypto();
-  const derBuffer = pemToArrayBuffer(pem);
-  return subtle.importKey(
-    "spki",
-    derBuffer,
-    {
-      name: "RSA-OAEP",
-      hash: "SHA-256",
-    },
-    true,
-    ["encrypt"]
-  );
+  try {
+    const derBuffer = pemToArrayBuffer(pem);
+    return await subtle.importKey(
+      "spki",
+      derBuffer,
+      {
+        name: "RSA-OAEP",
+        hash: "SHA-256",
+      },
+      true,
+      ["encrypt"]
+    );
+  } catch (err) {
+    throw new Error(
+      `Invalid RSA Public Key: failed to parse SPKI PEM format. Please ensure valid -----BEGIN PUBLIC KEY----- encoding.`
+    );
+  }
 }
 
 /**
  * Imports a PEM-encoded RSA-OAEP private key (PKCS#8 format).
  */
 export async function importRsaPrivateKey(pem: string): Promise<CryptoKey> {
+  if (!pem || typeof pem !== "string" || !pem.trim()) {
+    throw new Error("Secret Master Key (RSA Private Key) is missing or empty.");
+  }
   const subtle = getSubtleCrypto();
-  const derBuffer = pemToArrayBuffer(pem);
-  return subtle.importKey(
-    "pkcs8",
-    derBuffer,
-    {
-      name: "RSA-OAEP",
-      hash: "SHA-256",
-    },
-    true,
-    ["decrypt"]
-  );
+  try {
+    const derBuffer = pemToArrayBuffer(pem);
+    return await subtle.importKey(
+      "pkcs8",
+      derBuffer,
+      {
+        name: "RSA-OAEP",
+        hash: "SHA-256",
+      },
+      true,
+      ["decrypt"]
+    );
+  } catch (err) {
+    throw new Error(
+      `Invalid RSA Private Key: failed to parse PKCS#8 PEM format. Please ensure valid -----BEGIN PRIVATE KEY----- encoding.`
+    );
+  }
 }
 
 // ============================================================================
@@ -247,6 +265,36 @@ export async function computeSha256(data: ArrayBuffer): Promise<string> {
   const subtle = getSubtleCrypto();
   const hashBuffer = await subtle.digest("SHA-256", data);
   return arrayBufferToHex(hashBuffer);
+}
+
+/**
+ * Computes a standard SHA-256 fingerprint for a PEM-encoded RSA public or private key.
+ * Formats as readable SHA256:xx:xx:xx...
+ */
+export async function computeKeyFingerprint(pem: string): Promise<string> {
+  if (!pem || typeof pem !== "string" || !pem.trim()) return "";
+  try {
+    const der = pemToArrayBuffer(pem);
+    const hashHex = await computeSha256(der);
+    const pairs = hashHex.match(/.{1,2}/g) || [];
+    return `SHA256:${pairs.join(":")}`;
+  } catch {
+    return "Invalid Key";
+  }
+}
+
+/** Normalize raw hex or formatted SHA256 fingerprints to full 64-character hex. */
+export function normalizeSha256Fingerprint(fingerprint: string | undefined | null): string {
+  if (!fingerprint) return "";
+  const hex = fingerprint.trim().replace(/^SHA256:/i, "").replace(/[:\s]/g, "").toLowerCase();
+  return /^[0-9a-f]{64}$/.test(hex) ? hex : "";
+}
+
+/** Display a full SHA-256 fingerprint in colon-separated byte pairs. */
+export function formatSha256Fingerprint(fingerprint: string | undefined | null): string {
+  const hex = normalizeSha256Fingerprint(fingerprint);
+  if (!hex) return fingerprint || "";
+  return "SHA256:" + (hex.match(/.{2}/g) || []).join(":");
 }
 
 /**
@@ -395,6 +443,12 @@ export async function decryptHybrid(
   const dataView = new DataView(packageBuffer);
   const metadataLength = dataView.getUint32(268, false);
 
+  if (metadataLength > 1000000) {
+    throw new Error(
+      `Invalid packageBuffer: metadata length (${metadataLength} bytes) exceeds safety threshold of 1MB.`
+    );
+  }
+
   const headerPlusMetaLength = MIN_HEADER_BYTES + metadataLength;
   // AES-GCM outputs a 16-byte authentication tag appended to the ciphertext
   const minRequiredLength = headerPlusMetaLength + 16;
@@ -496,5 +550,172 @@ export async function decryptHybrid(
     fileName,
     fileType,
     unwrappedAesKeyHex,
+  };
+}
+
+// ============================================================================
+// Client-Side Password-Protected Private Key Backup (PBKDF2 + AES-256-GCM)
+// ============================================================================
+
+export interface EncryptedKeyBackup {
+  format: "vaultzero-encrypted-key";
+  version: number;
+  publicKeyPem: string;
+  fingerprint: string;
+  kdf: "PBKDF2-SHA256";
+  iterations: number;
+  saltHex: string;
+  ivHex: string;
+  ciphertextBase64: string;
+  createdAt: string;
+}
+
+/**
+ * Encrypts a private key using a user password via PBKDF2 (100,000 rounds) + AES-256-GCM.
+ * The operation is performed 100% locally in the browser; the password and private key
+ * are never transmitted to any server.
+ */
+export async function exportEncryptedPrivateKeyBackup(
+  privateKeyPem: string,
+  publicKeyPem: string,
+  passphrase: string
+): Promise<string> {
+  if (!passphrase || passphrase.length < 8) {
+    throw new Error("Backup passphrase must be at least 8 characters long.");
+  }
+  const subtle = getSubtleCrypto();
+  const cryptoInstance = getCrypto();
+
+  // 1. Generate 16 bytes salt and 12 bytes IV
+  const salt = new Uint8Array(16);
+  cryptoInstance.getRandomValues(salt);
+
+  const iv = new Uint8Array(12);
+  cryptoInstance.getRandomValues(iv);
+
+  // 2. Derive key from password using PBKDF2
+  const enc = new TextEncoder();
+  const baseKey = await subtle.importKey(
+    "raw",
+    enc.encode(passphrase),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+
+  const aesKey = await subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 100000,
+      hash: "SHA-256",
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt"]
+  );
+
+  // 3. Encrypt the raw PKCS#8 DER bytes
+  const privateKeyDer = pemToArrayBuffer(privateKeyPem);
+  const ciphertextBuffer = await subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv,
+    },
+    aesKey,
+    privateKeyDer
+  );
+
+  const fingerprint = await computeKeyFingerprint(publicKeyPem);
+
+  const backup: EncryptedKeyBackup = {
+    format: "vaultzero-encrypted-key",
+    version: 1,
+    publicKeyPem,
+    fingerprint,
+    kdf: "PBKDF2-SHA256",
+    iterations: 100000,
+    saltHex: arrayBufferToHex(salt),
+    ivHex: arrayBufferToHex(iv),
+    ciphertextBase64: arrayBufferToBase64(ciphertextBuffer),
+    createdAt: new Date().toISOString(),
+  };
+
+  return JSON.stringify(backup, null, 2);
+}
+
+/**
+ * Decrypts a password-protected .vaultkey backup file and restores the private/public keypair.
+ */
+export async function importEncryptedPrivateKeyBackup(
+  backupJsonString: string,
+  passphrase: string
+): Promise<{ privateKeyPem: string; publicKeyPem: string }> {
+  let backup: EncryptedKeyBackup;
+  try {
+    backup = JSON.parse(backupJsonString);
+  } catch {
+    throw new Error("Invalid key backup file: Malformed JSON structure.");
+  }
+
+  if (backup.format !== "vaultzero-encrypted-key" || backup.version !== 1) {
+    throw new Error("Unsupported key backup format or version.");
+  }
+
+  const subtle = getSubtleCrypto();
+  const salt = new Uint8Array(hexToArrayBuffer(backup.saltHex));
+  const iv = new Uint8Array(hexToArrayBuffer(backup.ivHex));
+  const ciphertextBuffer = base64ToArrayBuffer(backup.ciphertextBase64);
+
+  // 1. Derive key using PBKDF2
+  const enc = new TextEncoder();
+  const baseKey = await subtle.importKey(
+    "raw",
+    enc.encode(passphrase),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+
+  const aesKey = await subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: backup.iterations || 100000,
+      hash: "SHA-256",
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+
+  // 2. Decrypt PKCS#8 DER bytes
+  let privateKeyDer: ArrayBuffer;
+  try {
+    privateKeyDer = await subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv,
+      },
+      aesKey,
+      ciphertextBuffer
+    );
+  } catch {
+    throw new Error(
+      "Decryption failed: Incorrect passphrase or corrupted backup file (AES-GCM authentication tag mismatch)."
+    );
+  }
+
+  // 3. Re-encode as PEM
+  const privateKeyPem = formatAsPem(arrayBufferToBase64(privateKeyDer), "PRIVATE KEY");
+
+  // Validate that the decrypted private key is a valid RSA-OAEP key
+  await importRsaPrivateKey(privateKeyPem);
+
+  return {
+    privateKeyPem,
+    publicKeyPem: backup.publicKeyPem,
   };
 }

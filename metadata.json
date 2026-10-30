@@ -1,0 +1,6 @@
+{
+  "name": "VaultZero",
+  "description": "Client-Side Hybrid Cryptographic Vault using AES-256-GCM and RSA-OAEP-2048 with native WebCrypto API.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

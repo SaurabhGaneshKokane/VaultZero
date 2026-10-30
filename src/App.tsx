@@ -1,120 +1,130 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
+import { Navbar, AppTab } from "./components/Navbar";
+import { OverviewTab } from "./components/OverviewTab";
 import { VaultTab } from "./components/VaultTab";
 import { AdversarialLab } from "./components/AdversarialLab";
 import { BenchmarkTab } from "./components/BenchmarkTab";
-import { ShieldCheck, ShieldAlert, Gauge, Lock } from "lucide-react";
+import { KeyManagementModal } from "./components/KeyManagementModal";
+import { AuthScreen } from "./components/AuthScreen";
+import { KeyRecoveryGate } from "./components/KeyRecoveryGate";
+import { generateRsaKeyPair, computeKeyFingerprint, RsaKeyPairPem } from "./utils/cryptoEngine";
+import { checkBackendHealth, fetchUserProfile, fetchKeyById, publishPublicKey, BackendHealthResponse, PublicKeyDirectoryRecord, UserProfileResponse } from "./utils/apiClient";
+import { useAuth } from "./context/AuthContext";
+
+const SESSION_PUBKEY_KEY = "vaultzero_pubkey_pem";
+const SESSION_PRIVKEY_KEY = "vaultzero_privkey_pem";
+
+type KeyState = "checking" | "create" | "restore" | "ready" | "error";
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<"core" | "adversarial" | "benchmark">("core");
+  const { session, user, loading: authLoading, signOut } = useAuth();
+  const [activeTab, setActiveTab] = useState<AppTab>("overview");
+  const [vaultMode, setVaultMode] = useState<"send" | "unlock">("send");
+  const [publicKeyPem, setPublicKeyPem] = useState("");
+  const [privateKeyPem, setPrivateKeyPem] = useState("");
+  const [isGeneratingKeys, setIsGeneratingKeys] = useState(false);
+  const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
+  const [backendHealth, setBackendHealth] = useState<{ isAvailable: boolean; data?: BackendHealthResponse; checked: boolean }>({ isAvailable: false, checked: false });
+  const [profile, setProfile] = useState<UserProfileResponse | null>(null);
+  const [activeDirectoryRecord, setActiveDirectoryRecord] = useState<PublicKeyDirectoryRecord | undefined>();
+  const [keyState, setKeyState] = useState<KeyState>("checking");
+  const [keyError, setKeyError] = useState("");
 
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans selection:bg-blue-100 selection:text-blue-900">
-      {/* Top Header & Navigation Shell */}
-      <header className="border-b border-slate-200 bg-white/90 sticky top-0 z-50 backdrop-blur-md">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between py-3.5 gap-4">
-            {/* Branding & Header */}
-            <div className="flex items-center space-x-3.5">
-              <div className="p-2.5 rounded-xl bg-blue-600 text-white shadow-sm border border-blue-700">
-                <Lock className="w-5 h-5" />
-              </div>
-              <div>
-                <h1 className="font-bold text-lg sm:text-xl tracking-tight text-slate-900 flex items-center gap-2">
-                  <span>VaultZero: End-to-End Hybrid Cryptographic Vault</span>
-                </h1>
-                <p className="text-xs text-slate-500 flex items-center space-x-2">
-                  <span>AES-256-GCM (AEAD) + RSA-OAEP-2048</span>
-                  <span className="text-slate-300">•</span>
-                  <span className="text-emerald-700 font-mono text-[11px] flex items-center gap-1 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    Native WebCrypto
-                  </span>
-                </p>
-              </div>
-            </div>
+  useEffect(() => {
+    if (authLoading) return;
+    let cancelled = false;
+    setProfile(null); setActiveDirectoryRecord(undefined); setPublicKeyPem(""); setPrivateKeyPem("");
+    sessionStorage.removeItem(SESSION_PUBKEY_KEY); sessionStorage.removeItem(SESSION_PRIVKEY_KEY);
+    if (!session?.access_token || !user) { setKeyState("checking"); return; }
 
-            {/* 3 Selectable Tabs */}
-            <nav className="flex items-center bg-slate-100 p-1 rounded-2xl border border-slate-200 text-xs sm:text-sm font-medium self-start md:self-auto overflow-x-auto max-w-full">
-              {/* Tab 1: Core Vault */}
-              <button
-                id="tab-core-vault"
-                onClick={() => setActiveTab("core")}
-                className={`px-4 py-2 rounded-xl transition-all duration-200 cursor-pointer flex items-center space-x-2 whitespace-nowrap ${
-                  activeTab === "core"
-                    ? "bg-blue-600 text-white shadow-sm font-semibold"
-                    : "text-slate-600 hover:text-slate-900 hover:bg-white"
-                }`}
-              >
-                <ShieldCheck className="w-4 h-4" />
-                <span>Core Vault</span>
-              </button>
+    const initializeAccount = async () => {
+      setKeyState("checking"); setKeyError("");
+      try {
+        const accountProfile = await fetchUserProfile(session.access_token);
+        if (cancelled) return;
+        setProfile(accountProfile);
+        if (accountProfile.active_key) {
+          const record = await fetchKeyById(session.access_token, accountProfile.active_key.key_id);
+          if (cancelled) return;
+          setActiveDirectoryRecord(record);
+        }
+        const storedPublic = sessionStorage.getItem(SESSION_PUBKEY_KEY);
+        const storedPrivate = sessionStorage.getItem(SESSION_PRIVKEY_KEY);
+        if (storedPublic && storedPrivate) {
+          const localFingerprint = await computeKeyFingerprint(storedPublic);
+          if (cancelled) return;
+          if (accountProfile.active_key && localFingerprint.toLowerCase() !== accountProfile.active_key.fingerprint.toLowerCase()) {
+            sessionStorage.removeItem(SESSION_PUBKEY_KEY); sessionStorage.removeItem(SESSION_PRIVKEY_KEY);
+            setKeyState("restore"); return;
+          }
+          setPublicKeyPem(storedPublic); setPrivateKeyPem(storedPrivate);
+          if (accountProfile.active_key) setKeyState("ready");
+          else setKeyState("create");
+          return;
+        }
+        if (accountProfile.active_key) { setKeyState("restore"); return; }
+        setIsGeneratingKeys(true);
+        const pair = await generateRsaKeyPair();
+        if (cancelled) return;
+        setPublicKeyPem(pair.publicKeyPem); setPrivateKeyPem(pair.privateKeyPem);
+        setKeyState("create");
+      } catch (cause) {
+        if (!cancelled) { setKeyError(cause instanceof Error ? cause.message : "Could not initialize your account."); setKeyState("error"); }
+      } finally { if (!cancelled) setIsGeneratingKeys(false); }
+    };
+    void initializeAccount();
+    return () => { cancelled = true; };
+  }, [authLoading, user?.id]);
 
-              {/* Tab 2: Adversarial Lab */}
-              <button
-                id="tab-adversarial-lab"
-                onClick={() => setActiveTab("adversarial")}
-                className={`px-4 py-2 rounded-xl transition-all duration-200 cursor-pointer flex items-center space-x-2 whitespace-nowrap ${
-                  activeTab === "adversarial"
-                    ? "bg-rose-600 text-white shadow-sm font-semibold"
-                    : "text-slate-600 hover:text-slate-900 hover:bg-white"
-                }`}
-              >
-                <ShieldAlert className="w-4 h-4" />
-                <span>Adversarial Lab</span>
-                <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono hidden lg:inline ${
-                  activeTab === "adversarial"
-                    ? "bg-rose-700 text-rose-100"
-                    : "bg-rose-100 text-rose-700 border border-rose-200"
-                }`}>
-                  Tamper
-                </span>
-              </button>
+  useEffect(() => {
+    let mounted = true;
+    const probe = async () => {
+      const result = await checkBackendHealth();
+      if (mounted) setBackendHealth({ isAvailable: result.isAvailable, data: result.data, checked: true });
+    };
+    void probe(); const interval = setInterval(probe, 30000);
+    return () => { mounted = false; clearInterval(interval); };
+  }, []);
 
-              {/* Tab 3: Benchmark Suite */}
-              <button
-                id="tab-benchmark-suite"
-                onClick={() => setActiveTab("benchmark")}
-                className={`px-4 py-2 rounded-xl transition-all duration-200 cursor-pointer flex items-center space-x-2 whitespace-nowrap ${
-                  activeTab === "benchmark"
-                    ? "bg-emerald-600 text-white shadow-sm font-semibold"
-                    : "text-slate-600 hover:text-slate-900 hover:bg-white"
-                }`}
-              >
-                <Gauge className="w-4 h-4" />
-                <span>Benchmark Suite</span>
-                <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono hidden lg:inline ${
-                  activeTab === "benchmark"
-                    ? "bg-emerald-700 text-emerald-100"
-                    : "bg-emerald-100 text-emerald-700 border border-emerald-200"
-                }`}>
-                  Metrics
-                </span>
-              </button>
-            </nav>
-          </div>
-        </div>
-      </header>
+  const handleRegenerateKeys = async (forRotation = false): Promise<RsaKeyPairPem> => {
+    if (!forRotation && profile?.active_key) throw new Error("An active key already protects your account. Use explicit key rotation.");
+    setIsGeneratingKeys(true);
+    try {
+      const pair = await generateRsaKeyPair();
+      if (!forRotation) {
+        sessionStorage.setItem(SESSION_PUBKEY_KEY, pair.publicKeyPem); sessionStorage.setItem(SESSION_PRIVKEY_KEY, pair.privateKeyPem);
+        setPublicKeyPem(pair.publicKeyPem); setPrivateKeyPem(pair.privateKeyPem);
+      }
+      return pair;
+    } finally { setIsGeneratingKeys(false); }
+  };
 
-      {/* Main Tab Content */}
-      <main className="flex-1 py-4 sm:py-6">
-        {activeTab === "core" && <VaultTab />}
-        {activeTab === "adversarial" && <AdversarialLab />}
-        {activeTab === "benchmark" && <BenchmarkTab />}
-      </main>
+  const handleKeyReady = (pub: string, priv: string, record?: PublicKeyDirectoryRecord) => {
+    sessionStorage.setItem(SESSION_PUBKEY_KEY, pub); sessionStorage.setItem(SESSION_PRIVKEY_KEY, priv);
+    setPublicKeyPem(pub); setPrivateKeyPem(priv);
+    if (record) {
+      setActiveDirectoryRecord(record);
+      setProfile((current) => current ? { ...current, active_key: { key_id: record.key_id, algorithm: record.algorithm, key_size_bits: record.key_size_bits, fingerprint: record.fingerprint, registered_at: record.registered_at, status: record.status } } : current);
+    }
+    setKeyState("ready");
+  };
 
-      {/* Footer with Academic Citation */}
-      <footer className="border-t border-slate-200 bg-white py-6 px-4 sm:px-6 lg:px-8 mt-auto text-center font-mono text-xs text-slate-500">
-        <div className="max-w-7xl mx-auto space-y-1.5">
-          <p className="text-slate-800 font-semibold tracking-wide">
-            Shah & Anchor Kutchhi Engineering College, CNS Micro-Project Stage 2
-          </p>
-          <p className="text-slate-500 text-[11px]">
-            VaultZero Cryptographic Subsystem • Cryptography & Network Security (CNS) • Zero-Knowledge Hybrid Encryption
-          </p>
-        </div>
-      </footer>
-    </div>
-  );
+  if (authLoading) return <div className="min-h-screen grid place-items-center text-sm text-slate-500">Restoring secure session?</div>;
+  if (!session || !user) return <AuthScreen />;
+  if (keyState === "checking") return <div className="min-h-screen grid place-items-center text-sm text-slate-500">Checking your account and key recovery status?</div>;
+  if (keyState === "error") return <main className="min-h-screen grid place-items-center p-6"><div className="max-w-lg rounded-xl border border-rose-200 bg-rose-50 p-5 text-sm text-rose-800">{keyError}<button onClick={() => void signOut()} className="block mt-4 underline">Sign out</button></div></main>;
+  if (keyState === "create" || keyState === "restore") return <KeyRecoveryGate mode={keyState} accessToken={session.access_token} email={user.email || ""} publicKeyPem={publicKeyPem} privateKeyPem={privateKeyPem} expectedFingerprint={activeDirectoryRecord?.fingerprint_raw_hex} onReady={handleKeyReady} />;
+
+  return <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans selection:bg-blue-100 selection:text-blue-900">
+    <Navbar activeTab={activeTab} setActiveTab={setActiveTab} onOpenKeyManagement={() => setIsKeyModalOpen(true)} backendHealth={backendHealth} hasKeyPair={Boolean(publicKeyPem && privateKeyPem)} authenticatedEmail={user.email || ""} onSignOut={() => void signOut()} />
+    <main className="flex-1 py-6">
+      {activeTab === "overview" && <OverviewTab onNavigateToSend={() => { setVaultMode("send"); setActiveTab("vault"); }} onNavigateToUnlock={() => { setVaultMode("unlock"); setActiveTab("vault"); }} onNavigateToLab={() => setActiveTab("lab")} onNavigateToBenchmarks={() => setActiveTab("benchmarks")} />}
+      {activeTab === "vault" && <VaultTab initialMode={vaultMode} publicKeyPem={publicKeyPem} privateKeyPem={privateKeyPem} accessToken={session.access_token} onOpenKeyManagement={() => setIsKeyModalOpen(true)} backendHealth={backendHealth} />}
+      {activeTab === "lab" && <AdversarialLab accessToken={session.access_token} />}
+      {activeTab === "benchmarks" && <BenchmarkTab />}
+    </main>
+    <KeyManagementModal isOpen={isKeyModalOpen} onClose={() => setIsKeyModalOpen(false)} publicKeyPem={publicKeyPem} privateKeyPem={privateKeyPem} onRegenerateKeys={handleRegenerateKeys} onKeysRestored={(pub, priv) => { setPublicKeyPem(pub); setPrivateKeyPem(priv); sessionStorage.setItem(SESSION_PUBKEY_KEY, pub); sessionStorage.setItem(SESSION_PRIVKEY_KEY, priv); }} isGeneratingKeys={isGeneratingKeys} accessToken={session.access_token} authenticatedEmail={user.email || ""} authenticatedVaultId={profile?.vault_id || ""} currentDirectoryRecord={activeDirectoryRecord} onDirectoryRecordChange={(record) => { setActiveDirectoryRecord(record); if (record) setProfile((current) => current ? { ...current, active_key: { key_id: record.key_id, algorithm: record.algorithm, key_size_bits: record.key_size_bits, fingerprint: record.fingerprint, registered_at: record.registered_at, status: record.status } } : current); }} />
+  </div>;
 };
 
 export default App;

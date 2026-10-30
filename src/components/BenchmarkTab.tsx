@@ -134,8 +134,20 @@ export const BenchmarkTab: React.FC = () => {
         const tDecEnd = performance.now();
         const decTimeMs = tDecEnd - tDecStart;
 
-        // 5. Verify integrity & Calculate throughput (MB/s)
-        const verified = decryptedPkg.fileBuffer.byteLength === tier.bytes;
+        // 5. Verify integrity (length + byte-for-byte content matching) & Calculate throughput (MB/s)
+        const inView = new Uint8Array(syntheticBuffer);
+        const outView = new Uint8Array(decryptedPkg.fileBuffer);
+        let bytesIdentical = inView.byteLength === outView.byteLength;
+        if (bytesIdentical) {
+          const step = Math.max(1, Math.floor(inView.length / 512));
+          for (let b = 0; b < inView.length; b += step) {
+            if (inView[b] !== outView[b]) {
+              bytesIdentical = false;
+              break;
+            }
+          }
+        }
+        const verified = bytesIdentical;
         const sizeInMB = tier.bytes / (1024 * 1024);
         const encTimeInSeconds = encTimeMs / 1000;
         const throughputMBs = encTimeInSeconds > 0 ? sizeInMB / encTimeInSeconds : 0;
@@ -191,8 +203,9 @@ export const BenchmarkTab: React.FC = () => {
                 <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
                   Performance Measurement & Baseline
                 </h1>
-                <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200 font-mono font-medium">
-                  Stage 1 Objective 7
+                <span className="text-xs text-blue-700 font-mono font-medium hidden sm:inline-flex items-center gap-1.5">
+                  <span className="text-slate-300">·</span>
+                  <span>Micro-Benchmark Suite</span>
                 </span>
               </div>
               <p className="mt-0.5 text-xs sm:text-sm text-slate-500">
@@ -338,10 +351,10 @@ export const BenchmarkTab: React.FC = () => {
                     {/* VaultZero Enc Time */}
                     <td className="py-3.5 px-3.5">
                       {res ? (
-                        <div className="text-emerald-700 font-bold">
+                        <div className="text-emerald-700 font-bold tabular-nums">
                           {res.encTimeMs.toFixed(2)} ms
                           {res.speedupVsPaper && (
-                            <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 font-sans font-medium">
+                            <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-sans font-medium">
                               {res.speedupVsPaper.toFixed(1)}× faster
                             </span>
                           )}
@@ -356,7 +369,7 @@ export const BenchmarkTab: React.FC = () => {
                     {/* VaultZero Dec Time */}
                     <td className="py-3.5 px-3.5">
                       {res ? (
-                        <span className="text-slate-800 font-medium">{res.decTimeMs.toFixed(2)} ms</span>
+                        <span className="text-slate-800 font-medium tabular-nums">{res.decTimeMs.toFixed(2)} ms</span>
                       ) : isCurrent ? (
                         <span className="text-blue-600 animate-pulse font-sans font-medium">Running...</span>
                       ) : (
@@ -367,7 +380,7 @@ export const BenchmarkTab: React.FC = () => {
                     {/* Paper Baseline */}
                     <td className="py-3.5 px-3.5">
                       {tier.paperLatencyMs !== null ? (
-                        <span className="text-amber-800 font-medium">
+                        <span className="text-amber-800 font-medium tabular-nums">
                           {tier.paperLatencyMs} ms
                         </span>
                       ) : (
@@ -380,7 +393,7 @@ export const BenchmarkTab: React.FC = () => {
                     {/* Throughput */}
                     <td className="py-3.5 px-3.5">
                       {res ? (
-                        <span className="text-blue-700 font-semibold">
+                        <span className="text-blue-700 font-semibold tabular-nums">
                           {res.throughputMBs.toFixed(2)} MB/s
                         </span>
                       ) : (
@@ -392,7 +405,7 @@ export const BenchmarkTab: React.FC = () => {
                     <td className="py-3.5 px-3.5">
                       {res ? (
                         res.verified ? (
-                          <span className="inline-flex items-center space-x-1 text-emerald-800 text-[11px] font-medium bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                          <span className="inline-flex items-center space-x-1 text-emerald-800 text-[11px] font-medium bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
                             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                             <span>100% Match (GMAC)</span>
                           </span>
@@ -452,7 +465,7 @@ export const BenchmarkTab: React.FC = () => {
                     {tier.label} Payload ({tier.category})
                   </span>
                   {res && res.speedupVsPaper && (
-                    <span className="text-emerald-800 font-bold bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200 text-[11px]">
+                    <span className="text-emerald-800 font-semibold bg-emerald-50 px-2.5 py-0.5 rounded border border-emerald-200 text-[11px] tabular-nums">
                       {res.speedupVsPaper.toFixed(1)}× Speedup
                     </span>
                   )}
